@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gargantua</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{display:block;cursor:grab}
+  canvas:active{cursor:grabbing}
+  body::before,body::after{content:"";position:fixed;left:0;right:0;z-index:2;background:#000;pointer-events:none;
+    height:max(0px,calc((100vh - 100vw/2.39)/2))}
+  body::before{top:0} body::after{bottom:0}
+  #hint{position:fixed;z-index:3;left:0;right:0;bottom:6vh;text-align:center;
+    font:300 12px/1.6 "Helvetica Neue",Arial,sans-serif;letter-spacing:.45em;text-indent:.45em;
+    color:rgba(255,240,220,.6);pointer-events:none;opacity:0;animation:hint 10s ease forwards}
+  @keyframes hint{0%,25%{opacity:0}40%,75%{opacity:1}100%{opacity:0}}
+  @media (prefers-reduced-motion:reduce){#hint{animation:none;opacity:.6}}
+</style>
+</head>
+<body>
+<div id="hint">drag to orbit &nbsp;·&nbsp; scroll to zoom</div>
+
+<script>
+// Import map uses unpkg; falls back to jsDelivr if unpkg is unreachable (e.g. sandboxed previews).
+(async () => {
+  const say = m => { const e = document.getElementById('hint');
+    e.style.cssText = 'opacity:1;animation:none;color:#f88;letter-spacing:0;white-space:pre-wrap;padding:0 5vw'; e.textContent = m; };
+  addEventListener('error', e => say('Error: ' + e.message));
+  addEventListener('unhandledrejection', e => say('Error: ' + e.reason));
+  let cdn = 'https://unpkg.com';
+  try { await fetch(cdn + '/three@0.160.0/package.json'); } catch (e) { cdn = 'https://cdn.jsdelivr.net/npm'; }
+  const v = '/three@0.160.0';
+  const im = document.createElement('script');
+  im.type = 'importmap';
+  im.textContent = JSON.stringify({imports:{three: cdn + v + '/build/three.module.js', 'three/addons/': cdn + v + '/examples/jsm/'}});
+  document.head.appendChild(im);
+  const m = document.createElement('script');
+  m.type = 'module';
+  m.textContent = document.getElementById('app').textContent;
+  document.body.appendChild(m);
+})();
+</script>
+
+<script type="text/plain" id="app">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {OutputPass} from 'three/addons/postprocessing/OutputPass.js';
+import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
+
+const VS = `
+varying vec2 vUv;
+void main(){ vUv = position.xy; gl_Position = vec4(position.xy, 0.0, 1.0); }
+`;
+
+// Units: Schwarzschild radius rs = 1. Rays are integrated backwards from the camera
+// with the Schwarzschild photon acceleration  a = -1.5 * h^2 * r_vec / r^5.
+const FS = `
+varying vec2 vUv;
+uniform vec3 uCam;
+uniform mat3 uRot;
+uniform float uTan, uAspect, uTime, uEsc;
+
+#define RIN 2.6
+#define ROUT 13.0
+
+float hash(vec3 p){ p = fract(p*0.3183099 + .1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float vnoise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.-2.*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x), mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x), f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x), mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x), f.y), f.z);
+}
+float fbm(vec3 p){ float a=.5, s=0.; for(int i=0;i<4;i++){ s += a*vnoise(p); p = p*2.03+7.1; a *= .5; } return s; }
+
+vec3 blackbody(float t){
+  vec3 c = vec3(1.0, .22, .03);
+  c = mix(c, vec3(1.0, .58, .2),  smoothstep(.15, .55, t));
+  c = mix(c, vec3(1.0, .88, .72), smoothstep(.5, 1.0, t));
+  c = mix(c, vec3(.72, .84, 1.0), smoothstep(1.0, 1.9, t));
+  return c;
+}
+
+vec3 stars(vec3 d){
+  vec3 c = vec3(0.);
+  for(int i=0;i<3;i++){
+    float s = 70. * pow(1.9, float(i));
+    float rad = .10 + .03*float(i);
+    vec3 p = d*s, id = floor(p), f = fract(p) - .5;
+    float h = hash(id + float(i)*13.7);
+    if(h > .9){
+      vec3 o = vec3(hash(id+1.3), hash(id+2.7), hash(id+4.1)) - .5;
+      float b = (1. - smoothstep(0., rad, length(f - o*.6))) * (h-.9)*10.;
+      vec3 tint = mix(vec3(1.,.62,.38), vec3(.6,.74,1.), hash(id+9.));
+      c += tint * b * b * 5.;
+    }
+  }
+  // faint galactic band
+  vec3 n = normalize(vec3(.3,.8,.5));
+  float lat = dot(d,n);
+  float band = exp(-lat*lat*16.);
+  float cl = fbm(d*3.5 + 1.);
+  c += band * (.012 + .09*cl*cl) * (1. - .85*smoothstep(.45,.75,fbm(d*7.+3.))) * mix(vec3(.9,.55,.4), vec3(.35,.5,.9), fbm(d*2.+5.));
+  return c;
+}
+
+void main(){
+  vec2 uv = vUv;
+  vec3 pos = uCam;
+  vec3 vel = normalize(uRot * vec3(uv.x*uTan*uAspect, uv.y*uTan, -1.));
+  vec3 col = vec3(0.);
+  float trans = 1.;
+  bool dead = true;
+
+  for(int i=0;i<320;i++){
+    float r2 = dot(pos,pos), r = sqrt(r2);
+    if(r < 1.0) break;                              // swallowed by the horizon
+    if(r > uEsc && dot(pos,vel) > 0.){ dead = false; break; }  // escaped to the stars
+    vec3 hv = cross(pos, vel);
+    float dt = clamp(.045*r, .02, .6);
+    vel += -1.5*dot(hv,hv)*pos/(r2*r2*r) * dt;
+    vec3 np = pos + vel*dt;
+
+    if(pos.y*np.y < 0.){                            // crossed the disk plane
+      vec3 hp = mix(pos, np, pos.y/(pos.y-np.y));
+      float hr = length(hp.xz);
+      if(hr > RIN && hr < ROUT){
+        float a = atan(hp.z, hp.x);
+        float om = 1.4/(hr*sqrt(hr));
+        float ap = a - uTime*om*.35;
+        vec3 q = vec3(cos(ap)*2.5, sin(ap)*2.5, hr*3.);
+        float n = fbm(q + 1.6*fbm(q*.6 - uTime*.04));
+        float rings = .5 + .5*sin(hr*9. + n*5.);
+        float dens = mix(.3, 1., n) * mix(.65, 1., rings);
+        float edge = smoothstep(RIN, RIN+.45, hr) * (1. - smoothstep(ROUT-4.5, ROUT, hr));
+
+        // Doppler beaming + gravitational redshift
+        vec3 tg = vec3(-hp.z, 0., hp.x) / hr;
+        float beta = sqrt(.5/(hr-1.));
+        float gam = inversesqrt(1. - beta*beta);
+        float D = 1./(gam*(1. - beta*dot(tg, -normalize(vel))));
+        float g = D*sqrt(1. - 1./hr);
+
+        float T = pow(RIN/hr, .75) * g * 1.15;
+        float emit = 5.5*(1. + 3.*exp(-(hr-RIN)*2.2))*pow(RIN/hr, 1.9) * pow(g, 3.) * dens * edge;
+        col += trans * blackbody(T) * emit;
+        trans *= 1. - edge*clamp(dens*1.2, 0., .85);
+      }
+    }
+    pos = np;
+  }
+
+  if(!dead) col += trans * stars(normalize(vel));
+
+  vec2 vv = uv * vec2(.75, 1.);
+  col *= (1. - .4*dot(vv,vv)) * smoothstep(0., 2.5, uTime);
+  if(!(col.r >= 0. && col.g >= 0. && col.b >= 0.)) col = vec3(0.);
+  gl_FragColor = vec4(min(col, vec3(60.)), 1.);
+}
+`;
+
+const renderer = new THREE.WebGLRenderer({antialias:false});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, .1, 200);
+camera.position.set(0, 4, 26);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.rotateSpeed = .5;
+controls.minDistance = 5;
+controls.maxDistance = 70;
+controls.autoRotate = true;
+controls.autoRotateSpeed = .25;
+let idle, intro = true;
+controls.addEventListener('start', () => { controls.autoRotate = false; intro = false; clearTimeout(idle); });
+controls.addEventListener('end', () => { idle = setTimeout(() => controls.autoRotate = true, 4000); });
+
+const U = {
+  uCam:{value:camera.position},
+  uRot:{value:new THREE.Matrix3()},
+  uTan:{value:Math.tan(THREE.MathUtils.degToRad(camera.fov/2))},
+  uAspect:{value:innerWidth/innerHeight},
+  uTime:{value:0},
+  uEsc:{value:40}
+};
+const quad = new THREE.Mesh(
+  new THREE.PlaneGeometry(2,2),
+  new THREE.ShaderMaterial({uniforms:U, vertexShader:VS, fragmentShader:FS, depthTest:false, depthWrite:false})
+);
+quad.frustumCulled = false;
+const scene = new THREE.Scene();
+scene.add(quad);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), .95, .85, .7));
+composer.addPass(new OutputPass());
+// Final lens pass: chromatic aberration, anamorphic streak, film grain
+const lens = new ShaderPass({
+  uniforms:{tDiffuse:{value:null}, uRes:{value:new THREE.Vector2(innerWidth,innerHeight)}, uTime:{value:0}},
+  vertexShader:`varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy,0.,1.); }`,
+  fragmentShader:`varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uTime;
+  float rnd(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
+  void main(){
+    vec2 c = vUv - .5; float k = dot(c,c);
+    vec3 col = vec3(texture2D(tDiffuse, vUv - c*k*.012).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv + c*k*.012).b);
+    vec3 s = vec3(0.);
+    for(int i=-14;i<=14;i++){
+      vec3 t = texture2D(tDiffuse, vUv + vec2(float(i)*3./uRes.x, 0.)).rgb;
+      s += max(t - .72, 0.) * exp(-abs(float(i))*.22);
+    }
+    col += s*vec3(.35,.6,1.)*.2;
+    col += (rnd(vUv*uRes + fract(uTime)) - .5)*.04;
+    gl_FragColor = vec4(col, 1.);
+  }`
+});
+composer.addPass(lens);
+
+addEventListener('resize', () => {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+  U.uAspect.value = w/h;
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const el = clock.getElapsedTime();
+  if(intro) camera.position.setLength(26 + 44*Math.pow(Math.max(0, 1 - el/8), 3));  // slow cinematic dolly-in
+  controls.update();
+  camera.updateMatrixWorld();
+  U.uRot.value.setFromMatrix4(camera.matrixWorld);
+  U.uTime.value = el;
+  lens.uniforms.uTime.value = el;
+  lens.uniforms.uRes.value.set(innerWidth*renderer.getPixelRatio(), innerHeight*renderer.getPixelRatio());
+  U.uEsc.value = camera.position.length()*1.1 + 8;
+  composer.render();
+});
+</script>
+</body>
+</html>
