@@ -1,5 +1,7 @@
 # Gargantua
 
+![Gargantua Logo](https://raw.githubusercontent.com/kaizen-flims/Podium-Air/main/Logo.png)
+
 A real-time, interactive black-hole visualization built with **Three.js** and custom GLSL shaders. The scene renders a gravitationally lensed star field and a glowing accretion disk around a Schwarzschild black hole, with cinematic post-processing.
 
 ## Live demo
